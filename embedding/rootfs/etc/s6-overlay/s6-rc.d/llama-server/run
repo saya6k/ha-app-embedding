@@ -1,0 +1,99 @@
+#!/command/with-contenv bashio
+# shellcheck shell=bash
+# ==============================================================================
+# Shared embedding server (upstream llama.cpp), serving the OpenAI-compatible
+# /v1/embeddings on port 8080 of the app's own network address. Other apps and
+# Home Assistant reach it at http://<hostname>:8080/v1; the port is not mapped
+# to the host unless the user maps it.
+# ==============================================================================
+set -euo pipefail
+
+readonly MODEL_DIR=/data/models
+readonly PORT=8080
+
+# shellcheck source=/dev/null
+source /usr/lib/ha-embedding/options.sh
+
+model_file="$(option model_file)"
+threads="$(option threads)"
+# The longest single input in tokens. A bidirectional embedding model must see
+# a whole input in one ubatch, so batch and ubatch are this size.
+context_size="$(option context_size)"
+context_size="${context_size:-1024}"
+parallel="$(option parallel)"
+parallel="${parallel:-1}"
+api_key="$(option api_key)"
+model="${MODEL_DIR}/${model_file}"
+
+# The model-download oneshot ran first (see dependencies.d) and this service is
+# not reached unless it succeeded, so the file is guaranteed present here.
+if [[ ! -f "${model}" ]]; then
+    bashio::log.fatal "Model missing at ${model} — model-download should have provided it."
+    exit 1
+fi
+
+# Map the app log level onto llama.cpp's -lv threshold, where messages with a
+# *higher* verbosity than N are dropped:
+#   0 generic  1 error  2 warning  3 info  4 trace  5 debug
+# Note --verbose is not used: it sets the threshold to INT_MAX, which dumps a
+# per-tensor trace of the whole model on every start.
+case "$(option log_level)" in
+    fatal)           llama_verbosity=0 ;;
+    error)           llama_verbosity=1 ;;
+    warning)         llama_verbosity=2 ;;
+    notice | info)   llama_verbosity=3 ;;
+    debug)           llama_verbosity=4 ;;
+    trace)           llama_verbosity=5 ;;
+    *)               llama_verbosity=3 ;;
+esac
+
+export LD_LIBRARY_PATH=/opt/llama
+
+# Passed through the environment rather than argv, so the key does not show up
+# in the process list.
+if [[ -n "${api_key}" ]]; then
+    export LLAMA_API_KEY="${api_key}"
+    auth="API key required"
+else
+    unset LLAMA_API_KEY
+    auth="no API key"
+fi
+
+# --ctx-size is shared by all slots, so it is context_size per slot. Each
+# request is computed whole in one ubatch of context_size tokens.
+#
+# Everything below them trims defaults that are meant for text generation and
+# are pure waste for an embeddings-only server. They matter on a 4-8 GiB Home
+# Assistant device running other apps:
+#
+#   --cache-ram 0      disables the prompt cache, which otherwise reserves up to
+#                      8 GiB. Embeddings never reuse a prompt prefix.
+#   --no-repack        skips the repacked copy of the weights (several hundred
+#                      MiB of non-reclaimable memory). Costs some matmul speed.
+#   --no-warmup        no dummy decode at startup — pointless for embeddings
+#   --no-context-shift no sliding window; inputs longer than the context fail
+#                      loudly instead of being silently truncated
+#   --no-ui            only /v1/embeddings, /v1/models and /health are used
+#
+# --flash-attn off keeps attention in F32. With flash attention, llama.cpp casts
+# K and V to F16, and EmbeddingGemma 2's model card warns against F16: its
+# activations can overflow it into NaN or degraded vectors. It also keeps the
+# vectors identical to the Memory app's own sidecar, which runs the same way.
+bashio::log.info "Starting embedding server on :${PORT} (threads=${threads}, context=${context_size}, parallel=${parallel}, ${auth})"
+exec /opt/llama/llama-server \
+    --model "${model}" \
+    --embeddings \
+    --host 0.0.0.0 \
+    --port "${PORT}" \
+    --threads "${threads}" \
+    --ctx-size "$((context_size * parallel))" \
+    --batch-size "${context_size}" \
+    --ubatch-size "${context_size}" \
+    --parallel "${parallel}" \
+    --cache-ram 0 \
+    --no-repack \
+    --no-warmup \
+    --no-context-shift \
+    --flash-attn off \
+    --no-ui \
+    --verbosity "${llama_verbosity}"

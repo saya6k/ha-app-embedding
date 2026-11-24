@@ -1,0 +1,8 @@
+{
+  "model_repo": "ggml-org/embeddinggemma-2-GGUF",
+  "model_file": "embeddinggemma-2-Q8_0.gguf",
+  "threads": 4,
+  "context_size": 1024,
+  "parallel": 1,
+  "api_key": "smoke-test-key"
+}

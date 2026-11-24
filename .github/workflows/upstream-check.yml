@@ -1,0 +1,83 @@
+---
+name: Upstream check
+
+# llama.cpp is pinned to an exact version so nothing moves under us on a
+# rebuild. This keeps the pin from going stale: one pull request
+# when a newer release exists, so each bump is reviewed rather than silently
+# picked up.
+
+# yamllint disable-line rule:truthy
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  llama-cpp:
+    name: Check llama.cpp
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          token: ${{ secrets.CATALOG_PAT }}
+
+      - name: Check for new release
+        env:
+          GH_TOKEN: ${{ secrets.CATALOG_PAT }}
+        run: |
+          set -euo pipefail
+          CURRENT=$(sed -n 's/^ARG LLAMA_BUILD=//p' embedding/Dockerfile)
+          # Not `gh release view`: upstream now marks every bNNNN build as a
+          # prerelease, and "latest" is a periodic vX.Y.Z release that carries
+          # no binaries. Take the newest bNNNN whose ubuntu assets have both
+          # finished uploading.
+          LATEST=$(gh api 'repos/ggml-org/llama.cpp/releases?per_page=30' --jq '
+            [.[] | .tag_name as $t | select($t | test("^b[0-9]+$"))
+              | select(([.assets[].name | select(
+                  . == "llama-\($t)-bin-ubuntu-arm64.tar.gz" or
+                  . == "llama-\($t)-bin-ubuntu-x64.tar.gz")] | length) == 2)
+            ][0].tag_name // empty')
+          [ -n "$LATEST" ] || { echo "::error::no bNNNN release with ubuntu assets found"; exit 1; }
+          echo "Latest : $LATEST"
+          echo "Current: $CURRENT"
+          [ -n "$CURRENT" ] || { echo "::error::ARG LLAMA_BUILD not found"; exit 1; }
+          [ "$LATEST" = "$CURRENT" ] && echo "Up to date." && exit 0
+
+          gh pr list --head "upstream/llama-cpp-${LATEST}" --json number --jq 'length' \
+            | grep -qv '^0$' && echo "PR already open." && exit 0
+
+          # Digests come from the release API rather than being recomputed, so
+          # the pin records exactly what GitHub serves.
+          ASSETS=$(gh release view "$LATEST" --repo ggml-org/llama.cpp \
+            --json assets --jq '.assets[] | "\(.name) \(.digest)"')
+          for arch in arm64 x64; do
+            name="llama-${LATEST}-bin-ubuntu-${arch}.tar.gz"
+            digest=$(printf '%s\n' "$ASSETS" | awk -v n="$name" '$1 == n {print $2}')
+            digest="${digest#sha256:}"
+            [ -n "$digest" ] || { echo "::error::$name has no digest"; exit 1; }
+            eval "SHA_${arch}=\$digest"
+          done
+
+          sed -i \
+            -e "s|^ARG LLAMA_BUILD=.*|ARG LLAMA_BUILD=${LATEST}|" \
+            -e "s|^ARG LLAMA_SHA256_AARCH64=.*|ARG LLAMA_SHA256_AARCH64=${SHA_arm64}|" \
+            -e "s|^ARG LLAMA_SHA256_AMD64=.*|ARG LLAMA_SHA256_AMD64=${SHA_x64}|" \
+            embedding/Dockerfile
+          git diff --quiet embedding/Dockerfile && \
+            { echo "::error::nothing changed — ARG lines may have been renamed"; exit 1; }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git switch -c "upstream/llama-cpp-${LATEST}"
+          git add embedding/Dockerfile
+          git commit -m "chore: bump llama.cpp ${CURRENT} → ${LATEST}"
+          git push origin "upstream/llama-cpp-${LATEST}"
+          gh pr create \
+            --base main --head "upstream/llama-cpp-${LATEST}" \
+            --title "chore: bump llama.cpp ${CURRENT} → ${LATEST}" \
+            --body "$(printf '## Upstream update\n\n[llama.cpp %s](https://github.com/ggml-org/llama.cpp/releases/tag/%s) released. Both sha256 values come from the release API, not recomputed.\n\n> These prebuilt binaries have broken against the base image before — they are built on Ubuntu 24.04 and need GLIBC_2.38, which Debian bookworm lacks. CI builds both arches; check the build-test job before merging.' "${LATEST}" "${LATEST}")" \
+            --assignee saya6k

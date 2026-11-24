@@ -1,0 +1,60 @@
+# BUILD_FROM is no longer injected by the Supervisor (>=2026.04.0) — default to
+# the HA base manifest, pinned rather than :latest. Overridable via --build-arg.
+#
+# trixie, NOT bookworm: the official llama.cpp Linux release binaries are built
+# on Ubuntu 24.04 and require GLIBC_2.38 / GLIBCXX_3.4.32. Debian bookworm ships
+# glibc 2.36, where they fail to load (verified on aarch64).
+ARG BUILD_FROM=ghcr.io/home-assistant/base-debian:trixie-2026.06.1
+FROM ${BUILD_FROM}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# The base image is labeled io.hass.type=base and build-image only stamps
+# io.hass.arch/version, so without this the app image inherits "base".
+LABEL io.hass.type="app"
+
+# ---- llama.cpp (prebuilt release, MIT) ------------------------------------
+ARG LLAMA_BUILD=b11496
+ARG LLAMA_SHA256_AARCH64=151a7366ec5b297459d1a7ec81dcdb8322966f1e12c27f10af0782dda99c2bf9
+ARG LLAMA_SHA256_AMD64=66f4b360a5fc5ebaea05d3903aeec4d5be4ee1efa6cd6121de170fd5908f45df
+
+# libgomp1: llama.cpp links OpenMP. libstdc++6: llama.cpp is C++.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      libgomp1 \
+      libstdc++6 \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN set -eu; \
+    case "$(uname -m)" in \
+      x86_64)  asset="llama-${LLAMA_BUILD}-bin-ubuntu-x64.tar.gz";   sha="${LLAMA_SHA256_AMD64}" ;; \
+      aarch64) asset="llama-${LLAMA_BUILD}-bin-ubuntu-arm64.tar.gz"; sha="${LLAMA_SHA256_AARCH64}" ;; \
+      *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/llama.tar.gz \
+      "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_BUILD}/${asset}"; \
+    echo "${sha}  /tmp/llama.tar.gz" | sha256sum -c -; \
+    mkdir -p /tmp/llama /opt/llama; \
+    tar -xzf /tmp/llama.tar.gz -C /tmp/llama; \
+    bin="$(find /tmp/llama -type f -name llama-server | head -1)"; \
+    [ -n "${bin}" ] || { echo "llama-server not found in release archive" >&2; exit 1; }; \
+    cp -a "$(dirname "${bin}")/." /opt/llama/; \
+    chmod a+x /opt/llama/llama-server; \
+    rm -rf /tmp/llama /tmp/llama.tar.gz; \
+    LD_LIBRARY_PATH=/opt/llama /opt/llama/llama-server --version
+
+# ---- rootfs (s6 services) --------------------------------------------------
+# A failed oneshot (notably model-download: bad repo/file or checksum mismatch)
+# must stop the app with the error still visible, instead of leaving it up in
+# a broken state. Restarting is pointless for a configuration error.
+ENV S6_BEHAVIOUR_IF_STAGE2_FAILS=2
+
+COPY rootfs /
+
+RUN find /etc/s6-overlay/s6-rc.d -type f \( -name run -o -name finish -o -name "up*" \) \
+      -exec chmod a+x {} \; \
+ && find /etc/s6-overlay/s6-rc.d -type f -name type -exec chmod 644 {} \;
+
+WORKDIR /

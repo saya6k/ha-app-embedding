@@ -1,0 +1,11 @@
+data
+.DS_Store
+*.log
+
+# Store assets and docs — read by the Supervisor from the app folder,
+# never needed inside the image.
+icon.png
+logo.png
+.README.j2
+translations/
+DOCS.md
