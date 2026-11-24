@@ -14,9 +14,9 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 LABEL io.hass.type="app"
 
 # ---- llama.cpp (prebuilt release, MIT) ------------------------------------
-ARG LLAMA_BUILD=b11496
-ARG LLAMA_SHA256_AARCH64=151a7366ec5b297459d1a7ec81dcdb8322966f1e12c27f10af0782dda99c2bf9
-ARG LLAMA_SHA256_AMD64=66f4b360a5fc5ebaea05d3903aeec4d5be4ee1efa6cd6121de170fd5908f45df
+ARG LLAMA_BUILD=b12669
+ARG LLAMA_SHA256_AARCH64=8fdc502e07762dd5340620bcc3ad57af82a6b277790cfd2125ef7afdf1d690ec
+ARG LLAMA_SHA256_AMD64=67d4bb52a775aa00a77895c07af4d95fc28b7b51c1e4dd04ecf6af21d08138a4
 
 # libgomp1: llama.cpp links OpenMP. libstdc++6: llama.cpp is C++.
 RUN apt-get update \
